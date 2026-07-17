@@ -813,11 +813,49 @@ function pctR(ages,data,age,val) {
   return {t:"50th",n:50};
 }
 
+// SD estimated from centiles: P3=z-1.88079, P97=z+1.88079 => span = 3.76158 SD (NOT 4).
+var Z_SPAN = 3.76158;
 function calcSDS(ages,data,age,val) {
   var p50=lerp(ages,data.p50,age);
   var p97=lerp(ages,data.p97,age);
   var p3=lerp(ages,data.p3,age);
-  var sd=(p97-p3)/4;
+  var sd=(p97-p3)/Z_SPAN;
+  return sd>0 ? (val-p50)/sd : 0;
+}
+
+// ── HEIGHT REFERENCE (0-5y and 5-19y sets joined smoothly) ───────────────────
+// El-Mouzan 2005 publishes two separate height tables. They meet at 5y for girls
+// but jump ~2-3 cm for boys. Blend the two curves across a 57-63 month window so
+// the reference is continuous and a boy near the 3rd centile is not reclassified
+// by a 1-month age change. Source arrays are left untouched; this only reconciles
+// how they are read at the join.
+function htValue(boy,key,tm){
+  var d0=boy?D.BH0:D.GH0;                       // 0-60 months
+  var d5=boy?D.BH5:D.GH5;                        // 5-19 years
+  var a0=d0.a;                                   // already months
+  var a5=d5.a.map(function(x){return x*12;});   // years -> months
+  var lo=57,hi=63;
+  if(tm<=lo) return lerp(a0,d0[key],tm);
+  if(tm>=hi) return lerp(a5,d5[key],tm);
+  var w=(tm-lo)/(hi-lo);
+  return (1-w)*lerp(a0,d0[key],tm) + w*lerp(a5,d5[key],tm);
+}
+function pctRHt(boy,tm,val){
+  var ks=["p3","p10","p25","p50","p75","p90","p97"],ns=[3,10,25,50,75,90,97],vs=[];
+  for(var i=0;i<ks.length;i++) vs.push(htValue(boy,ks[i],tm));
+  if(val<=vs[0]) return {t:"<3rd",n:1};
+  if(val>=vs[vs.length-1]) return {t:">97th",n:99};
+  for(var i=0;i<vs.length-1;i++){
+    if(val>=vs[i]&&val<=vs[i+1]){
+      var t=(val-vs[i])/(vs[i+1]-vs[i]),n=ns[i]+t*(ns[i+1]-ns[i]);
+      return {t:Math.round(n)+"th",n:n};
+    }
+  }
+  return {t:"50th",n:50};
+}
+function calcSDSHt(boy,tm,val){
+  var p50=htValue(boy,"p50",tm),p97=htValue(boy,"p97",tm),p3=htValue(boy,"p3",tm);
+  var sd=(p97-p3)/Z_SPAN;
   return sd>0 ? (val-p50)/sd : 0;
 }
 
@@ -826,31 +864,46 @@ function calcBMI() {
   g("bmiBox").value=(h>0&&w>0)?((w/((h/100)*(h/100))).toFixed(1)+" kg/m2"):"--";
 }
 
+// Age-aware growth-velocity assessment. The classic <4 / <5 cm/y cut-offs are only
+// valid for prepubertal children (~3-11y). Infants grow much faster and peri-pubertal
+// children have a spurt, so the thresholds and the reassurance are tiered by age.
+function assessGV(tm,gv){
+  if(gv<=0) return {level:"crit",note:"No growth or height loss — re-measure to exclude error; if confirmed this is a red flag."};
+  var note="";
+  var critCut,lowCut;
+  if(tm<36){ critCut=5; lowCut=7; note="Under 3 years: expected velocity is much higher — always compare with age-specific (WHO) velocity charts."; }
+  else if(tm>132){ critCut=4; lowCut=5; note="Peri-pubertal: interpret with pubertal stage; a spurt (~8-12 cm/y) is normally expected."; }
+  else { critCut=4; lowCut=5; }   // 3-11y prepubertal: thresholds validated
+  return {level:(gv<critCut?"crit":(gv<lowCut?"low":"ok")),note:note};
+}
 function calcGV() {
   var prevHt=parseFloat(g("prevHt").value);
   var prevMo=parseFloat(g("prevMo").value);
   var curHt=parseFloat(g("ht").value);
   var box=g("gvBox");
-  if(!prevHt||!prevMo||!curHt){box.style.display="none";return;}
+  if(!prevHt||!prevMo||!curHt){box.style.display="none";pt.gv=null;return;}
   if(prevMo<3){
     box.className="gv-box gv-warn";
     box.style.display="block";
     box.textContent="Warning: Interval less than 3 months — growth velocity result may not be reliable.";
+    pt.gv=null;
     return;
   }
-  if(curHt<=prevHt){box.style.display="none";return;}
+  var aY=parseFloat(g("ageY").value)||0, aM=parseFloat(g("ageM").value)||0, tm=aY*12+aM;
   var gv=((curHt-prevHt)/prevMo)*12;
   pt.gv=gv; pt.prevMo=prevMo;
+  var a=assessGV(tm,gv);
+  var noteHtml=a.note?"<div style='font-size:.72rem;margin-top:4px;opacity:.85'>"+a.note+"</div>":"";
   box.style.display="block";
-  if(gv<4){
+  if(a.level==="crit"){
     box.className="gv-box gv-bad";
-    box.innerHTML="&#128308; Growth Velocity: <strong>"+gv.toFixed(1)+" cm/year</strong> &mdash; CRITICALLY LOW (&lt;4 cm/year). Urgent referral indicated regardless of current percentile.";
-  } else if(gv<5){
+    box.innerHTML="&#128308; Growth Velocity: <strong>"+gv.toFixed(1)+" cm/year</strong> &mdash; CRITICALLY LOW for age. Urgent referral indicated regardless of current percentile."+noteHtml;
+  } else if(a.level==="low"){
     box.className="gv-box gv-warn";
-    box.innerHTML="&#9888; Growth Velocity: <strong>"+gv.toFixed(1)+" cm/year</strong> &mdash; LOW (&lt;5 cm/year). Warrants investigation and close follow-up.";
+    box.innerHTML="&#9888; Growth Velocity: <strong>"+gv.toFixed(1)+" cm/year</strong> &mdash; LOW for age. Warrants investigation and close follow-up."+noteHtml;
   } else {
     box.className="gv-box gv-ok";
-    box.innerHTML="&#10003; Growth Velocity: <strong>"+gv.toFixed(1)+" cm/year</strong> &mdash; Normal.";
+    box.innerHTML="&#10003; Growth Velocity: <strong>"+gv.toFixed(1)+" cm/year</strong> &mdash; within expected range for age."+noteHtml;
   }
 }
 
@@ -916,11 +969,9 @@ function doCalc() {
   var gv=pt.gv||null;
   pt={tm:tm,h:h,w:w,bmi:bmi,hc:hc,boy:boy,inf:inf,aY:aY,aM:aM,fHt:fHt,mHt:mHt,gv:gv,prevMo:pt.prevMo||null};
 
-  // Get height data & SDS
-  var htD=inf?(boy?D.BH0:D.GH0):(boy?D.BH5:D.GH5);
-  var htA=[]; for(var i=0;i<htD.a.length;i++) htA.push(inf?htD.a[i]:htD.a[i]*12);
-  var hP=pctR(htA,htD,tm,h);
-  var hSDS=calcSDS(htA,htD,tm,h);
+  // Height percentile & SDS (continuous across the 5-year join, correct z-span)
+  var hP=pctRHt(boy,tm,h);
+  var hSDS=calcSDSHt(boy,tm,h);
   pt.hSDS=hSDS; pt.hP=hP;
 
   // Weight percentile
@@ -956,10 +1007,11 @@ function doCalc() {
   if(hSDS<-3) urgentCriteria.push("Height < -3 SDS ("+hSDS.toFixed(2)+" SDS)");
   else if(hSDS<-2) routineCriteria.push("Height < -2 SDS / below 3rd percentile ("+hSDS.toFixed(2)+" SDS)");
 
-  // 2. Growth velocity
+  // 2. Growth velocity (age-aware)
   if(gv!==null){
-    if(gv<4) urgentCriteria.push("Growth velocity critically low: "+gv.toFixed(1)+" cm/year (< 4 cm/year)");
-    else if(gv<5) routineCriteria.push("Growth velocity low: "+gv.toFixed(1)+" cm/year (< 5 cm/year)");
+    var gvA=assessGV(tm,gv);
+    if(gvA.level==="crit") urgentCriteria.push("Growth velocity critically low for age: "+gv.toFixed(1)+" cm/year");
+    else if(gvA.level==="low") routineCriteria.push("Growth velocity low for age: "+gv.toFixed(1)+" cm/year");
   }
 
   // 3. MPH deviation
@@ -1032,7 +1084,8 @@ function doCalc() {
   // Measurements table
   var tb=g("mBody"); tb.innerHTML="";
   function pb(n,l){var c=n>=5?"pok":(n>=3?"pbd":"plo");return "<span class='pct "+c+"'>"+l+"</span>";}
-  tb.innerHTML+="<tr><td>Height / Length</td><td><strong>"+h+" cm</strong></td><td>"+pb(hP.n,hP.t)+" &nbsp; SDS: "+hSDS.toFixed(2)+"</td><td>"+(status==="normal"||status==="monitor"?"Normal / Watch":"Short Stature")+"</td></tr>";
+  var htInterp = hSDS < -2 ? "Short Stature" : (hSDS < -1 ? "Low-Normal" : "Normal");
+  tb.innerHTML+="<tr><td>Height / Length</td><td><strong>"+h+" cm</strong></td><td>"+pb(hP.n,hP.t)+" &nbsp; SDS: "+hSDS.toFixed(2)+"</td><td>"+htInterp+"</td></tr>";
   var wtInterp="--";
   if(wP){
     wtInterp=wP.n<3?"Underweight - investigate":(wP.n<10?"Low weight - monitor":(wP.n>97?"Severe overweight":(wP.n>90?"Overweight - monitor":"Normal")));
@@ -1045,7 +1098,8 @@ function doCalc() {
     var bmiPct=pctR(bmiD.a.map(function(x){return x*12;}),bmiD,tm,bmi);
     bmiPctStr=pb(bmiPct.n,bmiPct.t);
   }
-  var bl=bmi<13.5?"Underweight":(bmi<17?"Normal range":(bmi<25?"Adequate":"Elevated"));
+  // Under 5y: no formal BMI centile available here, so use age-appropriate ranges (not adult cut-offs)
+  var bl=bmi<14?"Low \u2014 assess nutrition":(bmi<18?"Within expected range for age":"Elevated for age \u2014 verify vs age-specific BMI centiles");
   if(!inf) bl=bmi<18.5?"Underweight":(bmi<25?"Normal":(bmi<30?"Overweight":"Obese"));
   tb.innerHTML+="<tr><td>BMI</td><td><strong>"+bmi.toFixed(1)+" kg/m2</strong></td><td>"+bmiPctStr+"</td><td>"+bl+"</td></tr>";
   if(gv) tb.innerHTML+="<tr><td>Growth Velocity</td><td><strong>"+gv.toFixed(1)+" cm/year</strong></td><td>--</td><td>"+(gv<4?"Critically Low":(gv<5?"Low":"Normal"))+"</td></tr>";
@@ -1227,7 +1281,8 @@ function doMPH() {
   var fh=parseFloat(g("fHt2").value)||parseFloat(g("fatherHt").value)||0;
   var mh=parseFloat(g("mHt2").value)||parseFloat(g("motherHt").value)||0;
   if(!fh||!mh){alert("Please enter both parents heights.");return;}
-  var mph=pt.boy?(fh+mh+13)/2:(fh+mh-13)/2;
+  var boyM=(pt.boy!==undefined)?pt.boy:(sex==="male");
+  var mph=boyM?(fh+mh+13)/2:(fh+mh-13)/2;
   var lo=(mph-8.5).toFixed(1),hi=(mph+8.5).toFixed(1),ch=pt.h,msg;
   if(ch<parseFloat(lo)) msg="&#9888; Child height ("+ch+" cm) is BELOW the target range &mdash; pathological cause likely.";
   else if(ch<=parseFloat(hi)) msg="&#10003; Child height ("+ch+" cm) is within target range &mdash; consistent with familial short stature.";
@@ -1265,6 +1320,8 @@ document.addEventListener("DOMContentLoaded",function(){
   g("prevMo").addEventListener("input",calcGV);
   g("prevMo").addEventListener("change",calcGV);
   g("ht").addEventListener("change",calcGV);
+  g("ageY").addEventListener("change",calcGV);
+  g("ageM").addEventListener("change",calcGV);
 
   // Y/N buttons
   setupYN("turner");
